@@ -32,17 +32,26 @@ No API keys needed. Optional Home Assistant support over MQTT.
 
 The ESP32's blue LED is on D2, so it flickers while the screen updates. That's normal.
 
-## Setting up a new unit
-1. Copy `src/secrets.example.h` to `src/secrets.h` and enter the Wi-Fi name and
-   password (2.4 GHz only). Leave `MQTT_HOST` as `""` unless the home runs
-   Home Assistant.
-2. In `src/main.cpp`, set `LATITUDE` / `LONGITUDE` for the home's location.
-   Set `CITY_OVERRIDE` to the name to show, or `""` to use the city NWS reports.
-   Set `TIMEZONE` if it's not US Central.
-3. Build and upload with PlatformIO: `pio run -t upload`.
+## Setting up a station (no computer needed)
+1. Plug it into any USB phone charger.
+2. The screen says to join the Wi-Fi network **Weather-Setup**. Join it on a
+   phone (no password).
+3. A setup page pops up (if not, open a browser to `192.168.4.1`). Tap
+   **Configure WiFi**, tap your home Wi-Fi in the list, type its password and
+   your **ZIP code**, then **Save**.
+4. The station connects and finds your town, weather location and time zone
+   from the ZIP code.
 
-The NWS forecast grid and nearest weather station are looked up automatically
-from the coordinates. NWS covers the US only.
+If the home Wi-Fi changes, the setup network comes back by itself. To start
+over (for example before giving a station away), hold the **BOOT** button on
+the ESP32 for 5 seconds.
+
+## Building and uploading
+- Gift units: `pio run -e gift -t upload` (no Home Assistant, nothing to edit).
+- Home Assistant station: copy `src/secrets.example.h` to `src/secrets.h`, fill
+  in the MQTT login, then `pio run -e home -t upload`.
+
+NWS weather covers the US only.
 
 ## Display settings
 The startup screen shows RED, GREEN, BLUE and YELLOW bars. If they're wrong,

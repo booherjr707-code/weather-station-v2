@@ -9,15 +9,21 @@
 // forecast periods spelled out, e.g. "TONIGHT: Mostly Clear, 5% rain ...
 // WEDNESDAY: Showers And Thunderstorms Likely, 72% rain, 1/4-1/2 in".
 //
-// Setting up a new unit (e.g. a gift for someone else):
-//   1. Edit LATITUDE/LONGITUDE below (the NWS grid, nearest weather station
-//      and city name are looked up automatically from these).
-//   2. Put their Wi-Fi in secrets.h. Leave MQTT_HOST "" unless they run Home
-//      Assistant.
+// Setup is done from a phone, no computer or code changes needed:
+//   1. Plug the station into any USB phone charger.
+//   2. The screen says to join the Wi-Fi network "Weather-Setup" on a phone.
+//   3. A page pops up: pick the home Wi-Fi, type its password and the ZIP
+//      code, tap Save. The station finds the location, city name and time
+//      zone from the ZIP code.
+// If the saved Wi-Fi stops working (new router/password), the setup network
+// comes back on its own. Holding the BOOT button for 5 seconds erases the
+// settings and starts setup over.
 //
-// Home Assistant: publishes the same MQTT entities as the original firmware
-// (device id weather_tft_<last 3 MAC bytes>), so an existing dashboard keeps
-// working when this replaces it.
+// Two builds (platformio.ini):
+//   pio run -e gift -t upload   for gift units: no Home Assistant, no secrets
+//   pio run -e home -t upload   for James's station: also publishes to Home
+//     Assistant over MQTT (logins in secrets.h), using the same entities as
+//     the original firmware (device id weather_tft_<last 3 MAC bytes>).
 //
 // Wiring (TFT 8-pin header -> ESP32):
 //   RST->D4  CS->D15  D/C->D2  DIN->D23  CLK->D18  VCC->VIN  BL->3V3  GND->GND
@@ -30,18 +36,20 @@
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <Fonts/FreeSansBold18pt7b.h>  // smooth big digits for the temperature
 #include <Fonts/FreeSansBold9pt7b.h>   // smooth smaller numbers (high/low, dew point, pressure)
 
 // ---------- Settings you edit ----------
-#include "secrets.h"  // Wi-Fi and MQTT logins (kept out of GitHub)
+#ifdef USE_MQTT
+#include "secrets.h"  // MQTT login for Home Assistant (kept out of GitHub)
+#endif
 
-const float LATITUDE  = 35.8423;   // Jonesboro, AR
-const float LONGITUDE = -90.7043;
-const char* CITY_OVERRIDE = "JONESBORO, AR";  // "" = use the city NWS reports for this spot
-
-// US Central time, switches to daylight saving automatically.
-const char* TIMEZONE = "CST6CDT,M3.2.0,M11.1.0";
+const char* SETUP_NETWORK = "Weather-Setup";      // Wi-Fi name shown during setup
+const uint32_t SETUP_PORTAL_TIMEOUT_S = 600;     // then retry the saved Wi-Fi
+const int RESET_BUTTON = 0;                      // BOOT button
+const uint32_t RESET_HOLD_MS = 5000;
 
 const char* NWS_USER_AGENT = "weather-station-v2 (github.com/booherjr707-code)";
 
@@ -172,6 +180,17 @@ struct Nowcast {
   int   firstWet = -1;  // first slot with rain, -1 = dry for the next hour
 };
 
+// Saved settings (ESP32 flash, survive power-off). Filled in by the phone
+// setup page; lat/lon, city and time zone come from the ZIP code.
+struct Settings {
+  char  zip[6] = "";
+  float lat = 0, lon = 0;
+  char  city[24] = "";
+  char  tz[48] = "";
+};
+Settings cfg;
+Preferences prefs;
+
 Location loc;
 Weather weather;
 ForecastDay forecast[3];
@@ -280,9 +299,8 @@ void showSplash() {
 
 bool connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
-  showMessage("Connecting WiFi", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin();  // credentials saved by the setup page
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
     delay(250);
@@ -319,10 +337,10 @@ bool getJson(const String& url, JsonDocument& doc, JsonDocument& filter, const c
 }
 
 // Looks up the NWS forecast grid, nearest observation station and city name
-// for LATITUDE/LONGITUDE, so a unit only needs its coordinates set.
+// for the saved location.
 bool lookupLocation() {
   String base = String("https://api.weather.gov/points/") +
-                String(LATITUDE, 4) + "," + String(LONGITUDE, 4);
+                String(cfg.lat, 4) + "," + String(cfg.lon, 4);
   JsonDocument filter;
   filter["properties"]["gridId"] = true;
   filter["properties"]["gridX"] = true;
@@ -338,8 +356,8 @@ bool lookupLocation() {
   loc.gridX = p["gridX"] | 0;
   loc.gridY = p["gridY"] | 0;
   String stationsUrl = p["observationStations"] | "";
-  if (CITY_OVERRIDE[0]) {
-    strlcpy(loc.city, CITY_OVERRIDE, sizeof(loc.city));
+  if (cfg.city[0]) {
+    strlcpy(loc.city, cfg.city, sizeof(loc.city));
   } else {
     snprintf(loc.city, sizeof(loc.city), "%s, %s",
              (const char*)(p["relativeLocation"]["properties"]["city"] | "?"),
@@ -572,7 +590,7 @@ bool fetchHourly() {
 // Active NWS alerts (watches/warnings/advisories) for this point.
 bool fetchAlerts() {
   String url = String("https://api.weather.gov/alerts/active?point=") +
-               String(LATITUDE, 4) + "," + String(LONGITUDE, 4);
+               String(cfg.lat, 4) + "," + String(cfg.lon, 4);
   JsonDocument filter;
   filter["features"][0]["properties"]["event"] = true;
   filter["features"][0]["properties"]["severity"] = true;
@@ -618,8 +636,8 @@ bool fetchAlerts() {
 
 // Open-Meteo 15-minute rain amounts for the next hour.
 bool fetchNowcast() {
-  String url = String("https://api.open-meteo.com/v1/forecast?latitude=") + String(LATITUDE, 4) +
-               "&longitude=" + String(LONGITUDE, 4) +
+  String url = String("https://api.open-meteo.com/v1/forecast?latitude=") + String(cfg.lat, 4) +
+               "&longitude=" + String(cfg.lon, 4) +
                "&minutely_15=precipitation&forecast_minutely_15=" + RAIN_SLOTS +
                "&precipitation_unit=inch&timezone=auto";
   JsonDocument filter;
@@ -684,7 +702,7 @@ void formatClock(char* buf, size_t len) {
 // Header text: cycles through the city name and the next three days, e.g.
 // "Tue 93/74 Sunny". The condition is dropped if it won't fit.
 void drawHeaderText() {
-  const char* text = loc.city[0] ? loc.city : CITY_OVERRIDE;
+  const char* text = loc.city[0] ? loc.city : cfg.city;
   char buf[28];
   uint32_t slot = (millis() / 1000 / HEADER_SLOT_SECS) % 4;
   if (forecastValid && slot > 0) {
@@ -850,6 +868,7 @@ void drawWeather() {
 }
 
 // ---------- Home Assistant (MQTT) ----------
+#ifdef USE_MQTT
 // Same device id, topics, keys and unique_ids as the original firmware, so
 // Home Assistant keeps the existing entities when this replaces it.
 
@@ -999,6 +1018,180 @@ void mqttLoop() {
   mqtt.loop();
   if (millis() - lastStatePublish > 60000UL) publishState();
 }
+#else
+void mqttLoop() {}  // gift build: no Home Assistant
+#endif
+
+// ---------- Phone setup (Wi-Fi + ZIP code) ----------
+
+void showSetupScreen() {
+  gfx->fillScreen(C_BLACK);
+  gfx->fillRect(0, 0, SCREEN_W, 14, C_HEADER);
+  drawCentered(3, "WEATHER STATION SETUP", C_WHITE, 1);
+  drawCentered(22, "On your phone, open", C_WHITE, 1);
+  drawCentered(33, "Wi-Fi settings and join:", C_WHITE, 1);
+  drawCentered(48, SETUP_NETWORK, C_YELLOW, 2);
+  drawCentered(72, "A page will pop up.", C_WHITE, 1);
+  drawCentered(85, "Pick your home Wi-Fi,", C_CYAN, 1);
+  drawCentered(96, "type its password and", C_CYAN, 1);
+  drawCentered(107, "your ZIP code, then Save.", C_CYAN, 1);
+  gfx->flush();
+}
+
+void loadSettings() {
+  prefs.begin("wx", true);
+  prefs.getString("zip", cfg.zip, sizeof(cfg.zip));
+  cfg.lat = prefs.getFloat("lat", 0);
+  cfg.lon = prefs.getFloat("lon", 0);
+  prefs.getString("city", cfg.city, sizeof(cfg.city));
+  prefs.getString("tz", cfg.tz, sizeof(cfg.tz));
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("wx", false);
+  prefs.putString("zip", cfg.zip);
+  prefs.putFloat("lat", cfg.lat);
+  prefs.putFloat("lon", cfg.lon);
+  prefs.putString("city", cfg.city);
+  prefs.putString("tz", cfg.tz);
+  prefs.end();
+}
+
+bool haveLocation() { return cfg.zip[0] && cfg.tz[0] && (cfg.lat != 0 || cfg.lon != 0); }
+
+// Converts an IANA time zone name (from Open-Meteo) into the POSIX rule the
+// ESP32 clock needs. Covers the US zones; anything else falls back to a
+// fixed offset without daylight saving.
+void posixFromIana(const char* iana, long utcOffsetSec, char* out, size_t len) {
+  struct Zone { const char* prefix; const char* rule; };
+  static const Zone zones[] = {
+    {"America/New_York", "EST5EDT,M3.2.0,M11.1.0"},   {"America/Detroit", "EST5EDT,M3.2.0,M11.1.0"},
+    {"America/Indiana/", "EST5EDT,M3.2.0,M11.1.0"},   {"America/Kentucky/", "EST5EDT,M3.2.0,M11.1.0"},
+    {"America/Indiana/Knox", "CST6CDT,M3.2.0,M11.1.0"}, {"America/Indiana/Tell_City", "CST6CDT,M3.2.0,M11.1.0"},
+    {"America/Chicago", "CST6CDT,M3.2.0,M11.1.0"},    {"America/Menominee", "CST6CDT,M3.2.0,M11.1.0"},
+    {"America/North_Dakota/", "CST6CDT,M3.2.0,M11.1.0"},
+    {"America/Denver", "MST7MDT,M3.2.0,M11.1.0"},     {"America/Boise", "MST7MDT,M3.2.0,M11.1.0"},
+    {"America/Phoenix", "MST7"},
+    {"America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0"},
+    {"America/Anchorage", "AKST9AKDT,M3.2.0,M11.1.0"}, {"America/Juneau", "AKST9AKDT,M3.2.0,M11.1.0"},
+    {"America/Sitka", "AKST9AKDT,M3.2.0,M11.1.0"},    {"America/Nome", "AKST9AKDT,M3.2.0,M11.1.0"},
+    {"Pacific/Honolulu", "HST10"},
+    {"America/Puerto_Rico", "AST4"},
+  };
+  // Longest matching prefix wins (so Indiana/Knox beats Indiana/).
+  const Zone* best = nullptr;
+  for (const Zone& z : zones) {
+    if (strncmp(iana, z.prefix, strlen(z.prefix)) == 0 &&
+        (!best || strlen(z.prefix) > strlen(best->prefix))) best = &z;
+  }
+  if (best) { strlcpy(out, best->rule, len); return; }
+  // POSIX offsets are hours *west* of UTC, so the sign flips.
+  snprintf(out, len, "UTC%+ld", -utcOffsetSec / 3600);
+}
+
+// Turns the ZIP code into lat/lon, a city name and a time zone.
+bool lookupZip(const char* zip) {
+  JsonDocument all;  // no filtering needed, these replies are tiny
+  all.set(true);
+  JsonDocument doc;
+  if (!getJson(String("https://api.zippopotam.us/us/") + zip, doc, all, "ZIP")) return false;
+  JsonObject place = doc["places"][0];
+  if (place.isNull()) return false;
+  float lat = atof(place["latitude"] | "0");
+  float lon = atof(place["longitude"] | "0");
+  if (lat == 0 && lon == 0) return false;
+  char city[24];
+  snprintf(city, sizeof(city), "%s, %s", (const char*)(place["place name"] | "?"),
+           (const char*)(place["state abbreviation"] | ""));
+  for (char* c = city; *c; c++) *c = toupper(*c);
+
+  JsonDocument tzDoc;
+  String tzUrl = String("https://api.open-meteo.com/v1/forecast?latitude=") + String(lat, 4) +
+                 "&longitude=" + String(lon, 4) + "&timezone=auto&forecast_days=1";
+  JsonDocument tzFilter;
+  tzFilter["timezone"] = true;
+  tzFilter["utc_offset_seconds"] = true;
+  if (!getJson(tzUrl, tzDoc, tzFilter, "Timezone")) return false;
+
+  strlcpy(cfg.zip, zip, sizeof(cfg.zip));
+  cfg.lat = lat;
+  cfg.lon = lon;
+  strlcpy(cfg.city, city, sizeof(cfg.city));
+  posixFromIana(tzDoc["timezone"] | "", tzDoc["utc_offset_seconds"] | 0L, cfg.tz, sizeof(cfg.tz));
+  saveSettings();
+  Serial.printf("ZIP %s -> %s (%.4f, %.4f), TZ %s\n", cfg.zip, cfg.city, cfg.lat, cfg.lon, cfg.tz);
+  return true;
+}
+
+// Connects to the saved Wi-Fi, or runs the phone setup page when there isn't
+// one (or it stops working, or no ZIP code is saved yet). Doesn't return
+// until the station is online with a location.
+void wifiAndLocationSetup() {
+  WiFiManager wm;
+  char zipDefault[6];
+  strlcpy(zipDefault, cfg.zip, sizeof(zipDefault));
+  WiFiManagerParameter zipField("zip", "Your 5-digit ZIP code", zipDefault, 5,
+                                "inputmode='numeric' pattern='[0-9]{5}' required");
+  wm.addParameter(&zipField);
+  wm.setTitle("Weather Station");
+  static const char* menu[] = {"wifi"};  // just the one button, keep it simple
+  wm.setMenu(menu, 1);
+  wm.setShowInfoUpdate(false);
+  wm.setConfigPortalTimeout(SETUP_PORTAL_TIMEOUT_S);
+  wm.setConnectTimeout(20);
+  wm.setAPCallback([](WiFiManager*) { showSetupScreen(); });
+
+  for (;;) {
+    bool online;
+    if (haveLocation()) {
+      showMessage("Connecting to Wi-Fi...");
+      online = wm.autoConnect(SETUP_NETWORK);  // falls back to the setup page
+    } else {
+      online = wm.startConfigPortal(SETUP_NETWORK);
+    }
+    if (!online) {
+      // Nobody finished setup within the timeout (or the router is down).
+      showMessage("No Wi-Fi yet", "Trying again...", C_ORANGE);
+      delay(3000);
+      ESP.restart();
+    }
+
+    const char* zip = zipField.getValue();
+    if (strlen(zip) == 5 && (strcmp(zip, cfg.zip) != 0 || !haveLocation())) {
+      showMessage("Finding your town...", zip);
+      if (!lookupZip(zip)) {
+        showMessage("ZIP code not found", "Please set up again", C_ORANGE);
+        cfg.zip[0] = 0;
+        saveSettings();
+        delay(4000);
+        continue;  // back to the setup page
+      }
+    }
+    if (haveLocation()) return;
+    continue;  // connected but still no ZIP: ask again
+  }
+}
+
+// Holding BOOT for RESET_HOLD_MS erases the Wi-Fi and ZIP code and restarts
+// into setup, e.g. before giving the station to someone else.
+void checkResetButton() {
+  static uint32_t pressedAt = 0;
+  if (digitalRead(RESET_BUTTON) == LOW) {
+    if (pressedAt == 0) pressedAt = millis();
+    if (millis() - pressedAt >= RESET_HOLD_MS) {
+      showMessage("Erasing settings...", "Setup will start", C_ORANGE);
+      prefs.begin("wx", false);
+      prefs.clear();
+      prefs.end();
+      WiFi.disconnect(true, true);  // also forgets the saved Wi-Fi
+      delay(2000);
+      ESP.restart();
+    }
+  } else {
+    pressedAt = 0;
+  }
+}
 
 // ---------- Main ----------
 
@@ -1023,15 +1216,13 @@ void setup() {
   showSplash();
   delay(2500);
 
-  if (!connectWiFi()) {
-    showMessage("WiFi failed", "Check SSID/password", C_ORANGE);
-    delay(2000);
-  } else {
-    showMessage("WiFi connected", WiFi.localIP().toString().c_str());
-    Serial.printf("WiFi connected, IP %s\n", WiFi.localIP().toString().c_str());
-    delay(1000);
-  }
-  configTzTime(TIMEZONE, "pool.ntp.org", "time.nist.gov");
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
+  loadSettings();
+  wifiAndLocationSetup();
+  showMessage("Wi-Fi connected", WiFi.localIP().toString().c_str());
+  Serial.printf("WiFi connected, IP %s\n", WiFi.localIP().toString().c_str());
+  delay(1000);
+  configTzTime(cfg.tz, "pool.ntp.org", "time.nist.gov");
 
   showMessage("Getting weather...");
   refreshWeather();
@@ -1044,6 +1235,7 @@ void setup() {
 }
 
 void loop() {
+  checkResetButton();
   uint32_t interval = lastFetchFailed ? 60UL * 1000UL : WEATHER_REFRESH_MS;
   if (millis() - lastFetch >= interval) refreshWeather();
 
