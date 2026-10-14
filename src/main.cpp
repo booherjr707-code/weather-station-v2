@@ -688,9 +688,14 @@ void drawAlertBanner() {
   drawMarquee(2, banner, SCREEN_W, flash ? C_WHITE : C_BLACK);
 }
 
+// Reads the clock directly. getLocalTime(&t, 0) can return false at random
+// when the millisecond ticks over mid-call (more likely during Wi-Fi/MQTT
+// traffic), which made the clock blink to "--:--" in bursts.
 void formatClock(char* buf, size_t len) {
+  time_t now = time(nullptr);
   struct tm t;
-  if (getLocalTime(&t, 0)) {
+  localtime_r(&now, &t);
+  if (t.tm_year > (2020 - 1900)) {  // NTP has set the clock
     int h = t.tm_hour % 12;
     if (h == 0) h = 12;
     snprintf(buf, len, "%d:%02d %s", h, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
