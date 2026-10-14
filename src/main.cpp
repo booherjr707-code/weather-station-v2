@@ -177,6 +177,7 @@ Weather weather;
 ForecastDay forecast[3];
 bool forecastValid = false;
 char marqueeText[360] = "";
+char stormLead[64] = "";  // e.g. "STORMS STARTING ~7 AM, peak 72% ~1 PM" from the hourly forecast
 bool marqueeWet = false;  // highlight the marquee when rain/storms are mentioned
 Nowcast nowcast;
 Alert alert;
@@ -523,6 +524,51 @@ bool fetchForecast() {
   return true;
 }
 
+void formatHour(const char* isoTime, char* out, size_t len) {
+  int hour = atoi(isoTime + 11);  // NWS times are already local, e.g. "2026-10-14T07:00:00-05:00"
+  int h12 = hour % 12;
+  snprintf(out, len, "%d %s", h12 == 0 ? 12 : h12, hour < 12 ? "AM" : "PM");
+}
+
+// Looks through the next 24 hours of the NWS hourly forecast for when rain
+// or storms start and when the chance peaks, so the marquee can say
+// "STORMS STARTING ~7 AM, peak 72% ~1 PM". Empty when nothing is coming.
+bool fetchHourly() {
+  String url = String("https://api.weather.gov/gridpoints/") + loc.gridId + "/" +
+               loc.gridX + "," + loc.gridY + "/forecast/hourly";
+  JsonDocument filter;
+  JsonObject f = filter["properties"]["periods"][0].to<JsonObject>();
+  f["startTime"] = true;
+  f["shortForecast"] = true;
+  f["probabilityOfPrecipitation"]["value"] = true;
+  JsonDocument doc;
+  if (!getJson(url, doc, filter, "Hourly")) return false;
+
+  const int START_POP = 30;  // % chance that counts as "starting"
+  JsonArray periods = doc["properties"]["periods"];
+  int startIdx = -1, peakIdx = -1, peakPop = 0;
+  bool storms = false;
+  for (int i = 0; i < 24 && i < (int)periods.size(); i++) {
+    JsonObject p = periods[i];
+    int pop = p["probabilityOfPrecipitation"]["value"] | 0;
+    const char* sf = p["shortForecast"] | "";
+    if (pop >= START_POP && startIdx < 0) startIdx = i;
+    if (startIdx >= 0 && containsCI(sf, "thunder")) storms = true;
+    if (pop > peakPop) { peakPop = pop; peakIdx = i; }
+  }
+
+  stormLead[0] = 0;
+  if (startIdx < 0) return true;
+  const char* kind = storms ? "STORMS" : "RAIN";
+  char startAt[8], peakAt[8];
+  formatHour(periods[startIdx]["startTime"] | "", startAt, sizeof(startAt));
+  formatHour(periods[peakIdx]["startTime"] | "", peakAt, sizeof(peakAt));
+  if (startIdx == 0) snprintf(stormLead, sizeof(stormLead), "%s NOW, peak %d%% ~%s", kind, peakPop, peakAt);
+  else snprintf(stormLead, sizeof(stormLead), "%s STARTING ~%s, peak %d%% ~%s", kind, startAt, peakPop, peakAt);
+  Serial.printf("Lead: %s\n", stormLead);
+  return true;
+}
+
 // Active NWS alerts (watches/warnings/advisories) for this point.
 bool fetchAlerts() {
   String url = String("https://api.weather.gov/alerts/active?point=") +
@@ -775,10 +821,11 @@ void drawWeather() {
   // Scrolling forecast line: current condition, then tonight/tomorrow in
   // full. Yellow when rain or storms are in it, so it catches the eye.
   {
-    static char line[sizeof(marqueeText) + 40];
-    if (marqueeText[0]) snprintf(line, sizeof(line), "Now: %s   *   %s", weather.condition, marqueeText);
+    static char line[sizeof(marqueeText) + sizeof(stormLead) + 40];
+    if (stormLead[0]) snprintf(line, sizeof(line), "%s   *   Now: %s   *   %s", stormLead, weather.condition, marqueeText);
+    else if (marqueeText[0]) snprintf(line, sizeof(line), "Now: %s   *   %s", weather.condition, marqueeText);
     else strlcpy(line, weather.condition, sizeof(line));
-    drawMarquee(MARQUEE_Y, line, CONTENT_RIGHT, marqueeWet ? C_YELLOW : C_COND);
+    drawMarquee(MARQUEE_Y, line, CONTENT_RIGHT, (marqueeWet || stormLead[0]) ? C_YELLOW : C_COND);
     // Keep the scrolling text out of the gauge column.
     gfx->fillRect(CONTENT_RIGHT, MARQUEE_Y - 1, SCREEN_W - CONTENT_RIGHT, 10, C_BLACK);
   }
@@ -963,6 +1010,7 @@ void refreshWeather() {
   }
   bool condOk = fetchConditions();
   bool fcOk   = fetchForecast();
+  if (fcOk) fetchHourly();
   lastFetchFailed = !(condOk && fcOk);
   lastFetch = millis();
 }
